@@ -100,6 +100,86 @@ class TransformerEncoder(nn.Module):
         return x
 
 @MODELS.register_module()
+class CostRegressionTransformer(nn.Module):
+    # dim ext for external features, drawings, administrative..
+    def __init__(self, config, dim_ext, **kwargs):
+        super().__init__()
+        self.config = config
+        self.trans_dim = config.trans_dim
+        self.depth = config.depth 
+        self.drop_path_rate = config.drop_path_rate 
+        self.cls_dim = config.cls_dim 
+        self.num_heads = config.num_heads 
+
+        self.group_size = config.group_size
+        self.num_group = config.num_group
+        self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)
+        self.encoder_dims = config.encoder_dims
+        self.encoder = Encoder(encoder_channel=self.encoder_dims)
+        self.reduce_dim = nn.Linear(self.encoder_dims, self.trans_dim)
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
+        self.cls_pos = nn.Parameter(torch.randn(1, 1, self.trans_dim))
+        self.pos_embed = nn.Sequential(
+            nn.Linear(3, 128),
+            nn.GELU(),
+            nn.Linear(128, self.trans_dim)
+        )  
+
+        dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.depth)]
+        self.blocks = TransformerEncoder(
+            embed_dim=self.trans_dim,
+            depth=self.depth,
+            drop_path_rate=dpr,
+            num_heads=self.num_heads
+        )
+        self.norm = nn.LayerNorm(self.trans_dim)
+
+        # Original classification head for finetuning (if used)
+        self.cls_head_finetune = nn.Sequential(
+            nn.Linear(self.trans_dim * 2, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, self.cls_dim)
+        )
+
+        # Fusion head for regression cost prediction
+        self.fusion_head = nn.Sequential(
+            nn.Linear(self.trans_dim * 2 + dim_ext, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, 1)  # single value output representing cost
+        )
+        self.build_loss_func()
+
+    def build_loss_func(self):
+        self.reg_loss = nn.MSELoss()
+
+    def forward(self, pts, extra_features):
+        # Divide the point cloud into groups
+        neighborhood, center = self.group_divider(pts)
+        group_input_tokens = self.encoder(neighborhood)  # B, G, N
+        group_input_tokens = self.reduce_dim(group_input_tokens)
+
+        # Prepare CLS tokens and positional embeddings
+        cls_tokens = self.cls_token.expand(group_input_tokens.size(0), -1, -1)
+        cls_pos = self.cls_pos.expand(group_input_tokens.size(0), -1, -1)
+        pos = self.pos_embed(center)
+
+        # Concatenate features and apply transformer
+        x = torch.cat((cls_tokens, group_input_tokens), dim=1)
+        pos = torch.cat((cls_pos, pos), dim=1)
+        x = self.blocks(x, pos)
+        x = self.norm(x)
+        concat_f = torch.cat([x[:, 0], x[:, 1:].max(1)[0]], dim=-1)
+
+        fused = torch.cat([concat_f, extra_features], dim=-1)
+        output = self.fusion_head(fused)
+        return output
+
+        
+
+@MODELS.register_module()
 class PointTransformer(nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__()

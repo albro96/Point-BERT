@@ -12,8 +12,10 @@ from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 import math
 import cv2
 import numpy as np
+import wandb
+from easydict import EasyDict
 
-def compute_loss(loss_1, loss_2, config, niter, train_writer):
+def compute_loss(loss_1, loss_2, config, niter):
     '''
     compute the final loss for optimization
     For dVAE: loss_1 : reconstruction loss, loss_2 : kld loss
@@ -29,9 +31,6 @@ def compute_loss(loss_1, loss_2, config, niter, train_writer):
         kld_weight = 0.
     else:
         kld_weight = target + (start - target) *  (1. + math.cos(math.pi * float(_niter) / ntime)) / 2.
-
-    if train_writer is not None:
-        train_writer.add_scalar('Loss/Batch/KLD_Weight', kld_weight, niter)
 
     loss = loss_1 + kld_weight * loss_2
 
@@ -50,11 +49,18 @@ def get_temp(config, niter):
     else:
         return 0 
 
-def run_net(args, config, train_writer=None, val_writer=None):
+def run_net(args, config):
     logger = get_logger(args.log_name)
     # build dataset
-    (train_sampler, train_dataloader), (_, test_dataloader) = builder.dataset_builder(args, config.dataset.train), \
-                                                            builder.dataset_builder(args, config.dataset.val)
+    
+    train_sampler, train_dataloader = builder.dataset_builder(
+        args, config.dataset, mode="train", bs=config.bs
+    )
+    _, val_dataloader = builder.dataset_builder(args, config.dataset, mode="val", bs=1)
+    _, test_dataloader = builder.dataset_builder(
+        args, config.dataset, mode="test", bs=1
+    )
+ 
     # build model
     base_model = builder.model_builder(config.model)
     if args.use_gpu:
@@ -90,48 +96,48 @@ def run_net(args, config, train_writer=None, val_writer=None):
     ChamferDisL1 = ChamferDistanceL1()
     ChamferDisL2 = ChamferDistanceL2()
 
-
     if args.resume:
         builder.resume_optimizer(optimizer, args, logger = logger)
 
+    if args.log_data:
+        wandb.watch(base_model)
+
     # trainval
     # training
+    
+
     base_model.zero_grad()
     for epoch in range(start_epoch, config.max_epoch + 1):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
+        # metrics = validate(base_model, val_dataloader, epoch, ChamferDisL1, ChamferDisL2, args, config, logger = None)
+        # if args.distributed:
+        #     train_sampler.set_epoch(epoch)
         base_model.train()
 
         epoch_start_time = time.time()
         batch_start_time = time.time()
         batch_time = AverageMeter()
         data_time = AverageMeter()
-        losses = AverageMeter(['Loss1', 'Loss2'])
+        losses = AverageMeter(config.loss_metrics)
 
         num_iter = 0
 
         base_model.train()  # set model to training mode
         n_batches = len(train_dataloader)
-        for idx, (taxonomy_ids, model_ids, data) in enumerate(train_dataloader):
+        for idx, (data, tooth) in enumerate(train_dataloader):
             num_iter += 1
             n_itr = epoch * n_batches + idx
             
             data_time.update(time.time() - batch_start_time)
-            npoints = config.dataset.train._base_.N_POINTS
-            dataset_name = config.dataset.train._base_.NAME
-            if dataset_name == 'ShapeNet':
-                points = data.cuda()
-            else:
-                raise NotImplementedError(f'Train phase do not support {dataset_name}')
+
+            points = data.to(args.device)
 
             temp = get_temp(config, n_itr)
-
 
             ret = base_model(points, temperature = temp, hard = False)
 
             loss_1, loss_2 = base_model.module.get_loss(ret, points)
 
-            _loss = compute_loss(loss_1, loss_2, config, n_itr, train_writer)
+            _loss = compute_loss(loss_1, loss_2, config, n_itr)
 
             _loss.backward()
 
@@ -153,13 +159,6 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 torch.cuda.synchronize()
 
 
-            if train_writer is not None:
-                train_writer.add_scalar('Loss/Batch/Loss_1', loss_1.item() * 1000, n_itr)
-                train_writer.add_scalar('Loss/Batch/Loss_2', loss_2.item() * 1000, n_itr)
-                train_writer.add_scalar('Loss/Batch/Temperature', temp, n_itr)
-                train_writer.add_scalar('Loss/Batch/LR', optimizer.param_groups[0]['lr'], n_itr)
-
-
             batch_time.update(time.time() - batch_start_time)
             batch_start_time = time.time()
 
@@ -175,49 +174,79 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 scheduler.step(epoch)
         epoch_end_time = time.time()
 
-        if train_writer is not None:
-            train_writer.add_scalar('Loss/Epoch/Loss_1', losses.avg(0), epoch)
-            train_writer.add_scalar('Loss/Epoch/Loss_2', losses.avg(1), epoch)
-
         print_log('[Training] EPOCH: %d EpochTime = %.3f (s) Losses = %s' %
             (epoch,  epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()]), logger = logger)
 
-        if epoch % args.val_freq == 0 and epoch != 0:
+        if epoch % args.val_freq == 0:
             # Validate the current model
-            metrics = validate(base_model, test_dataloader, epoch, ChamferDisL1, ChamferDisL2, val_writer, args, config, logger=logger)
+            metrics = validate(base_model, val_dataloader, epoch, ChamferDisL1, ChamferDisL2, args, config, logger = None)
 
             # Save ckeckpoints
-            if  metrics.better_than(best_metrics):
+            if metrics.better_than(best_metrics):
                 best_metrics = metrics
-                builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args, logger = logger)
-        builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger = logger)      
-        if (config.max_epoch - epoch) < 5:
-            builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, f'ckpt-epoch-{epoch:03d}', args, logger = logger)   
-    if train_writer is not None:  
-        train_writer.close()
-    if val_writer is not None:
-        val_writer.close()
+                if args.save_checkpoints and args.log_data:
+                    builder.save_checkpoint(
+                        base_model,
+                        optimizer,
+                        epoch,
+                        metrics,
+                        best_metrics,
+                        f"ckpt-best-{wandb.run.name}",
+                        args,
+                    )
 
-def validate(base_model, test_dataloader, epoch, ChamferDisL1, ChamferDisL2, val_writer, args, config, logger = None):
+
+        if args.save_checkpoints and not args.save_only_best and args.log_data:
+            builder.save_checkpoint(
+                base_model, optimizer, epoch, metrics, best_metrics, f"ckpt-last-{wandb.run.name}", args
+            )
+            # save every 100 epoch
+            if epoch % 100 == 0:
+                builder.save_checkpoint(
+                    base_model,
+                    optimizer,
+                    epoch,
+                    metrics,
+                    best_metrics,
+                    f"ckpt-epoch-{epoch:03d}-{wandb.run.name}",
+                    args,
+                )
+
+            if (config.max_epoch - epoch) < 2:
+                builder.save_checkpoint(
+                    base_model,
+                    optimizer,
+                    epoch,
+                    metrics,
+                    best_metrics,
+                    f"ckpt-epoch-{epoch:03d}-{wandb.run.name}",
+                    args,
+                )
+
+        if args.log_data:
+            log_dict = EasyDict()
+            log_dict.epoch = epoch
+
+            for idx, loss in enumerate(config.loss_metrics):
+                log_dict[f"train/{loss}"] = losses.avg()[idx]
+
+            wandb.log(log_dict, step=epoch)
+
+
+
+def validate(base_model, val_dataloader, epoch, ChamferDisL1, ChamferDisL2, args, config, logger = None):
     print_log(f"[VALIDATION] Start validating epoch {epoch}", logger = logger)
     base_model.eval()  # set model to eval mode
 
     test_losses = AverageMeter(['SparseLossL1', 'SparseLossL2', 'DenseLossL1', 'DenseLossL2'])
     test_metrics = AverageMeter(Metrics.names())
     category_metrics = dict()
-    n_samples = len(test_dataloader) # bs is 1
+    n_samples = len(val_dataloader) # bs is 1
 
     with torch.no_grad():
-        for idx, (taxonomy_ids, model_ids, data) in enumerate(test_dataloader):
-            taxonomy_id = taxonomy_ids[0] if isinstance(taxonomy_ids[0], str) else taxonomy_ids[0].item()
-            model_id = model_ids[0]
-
-            npoints = config.dataset.val._base_.N_POINTS
-            dataset_name = config.dataset.val._base_.NAME
-            if dataset_name == 'ShapeNet':
-                points = data.cuda()
-            else:
-                raise NotImplementedError(f'Train phase do not support {dataset_name}')
+        for idx, (data, tooth) in enumerate(val_dataloader):
+            tooth = tooth[0].item()
+            points = data.cuda()
 
             ret = base_model(inp = points, hard=True, eval=True)
             coarse_points = ret[0]
@@ -238,29 +267,44 @@ def validate(base_model, test_dataloader, epoch, ChamferDisL1, ChamferDisL2, val
 
             _metrics = Metrics.get(dense_points, points)
 
-            if taxonomy_id not in category_metrics:
-                category_metrics[taxonomy_id] = AverageMeter(Metrics.names())
-            category_metrics[taxonomy_id].update(_metrics)
+            if (val_dataloader.dataset.patient == "0538") and args.log_data and str(tooth)[-1] in ['1', '6']:
+                print('Logging PCDs')
 
-            vis_list = [0, 1000, 1600, 1800, 2400, 3400]
-            if val_writer is not None and idx in vis_list: #% 200 == 0:
-                input_pc = points.squeeze().detach().cpu().numpy()
-                input_pc = misc.get_ptcloud_img(input_pc)
-                val_writer.add_image('Model%02d/Input'% idx , input_pc, epoch, dataformats='HWC')
+                wandb.log(
+                    {
+                        f"val/pcd/dense/{val_dataloader.dataset.tooth}": wandb.Object3D(
+                            {
+                                "type": "lidar/beta",
+                                "points": dense_points[0].detach().cpu().numpy(),
+                            }
+                        ),
+                        f"val/pcd/coarse/{val_dataloader.dataset.tooth}": wandb.Object3D(
+                            {
+                                "type": "lidar/beta",
+                                "points": coarse_points[0].detach().cpu().numpy(),
+                            }
+                        ),
+                        f"val/pcd/gt/{val_dataloader.dataset.tooth}": wandb.Object3D(
+                            {
+                                "type": "lidar/beta",
+                                "points": points[0].detach().cpu().numpy(),
+                            }
+                        ),
+                    },
+                    step=epoch,
+                )
 
-                sparse = coarse_points.squeeze().cpu().numpy()
-                sparse_img = misc.get_ptcloud_img(sparse)
-                val_writer.add_image('Model%02d/Sparse' % idx, sparse_img, epoch, dataformats='HWC')
 
-                dense = dense_points.squeeze().cpu().numpy()
-                dense_img = misc.get_ptcloud_img(dense)
-                val_writer.add_image('Model%02d/Dense' % idx, dense_img, epoch, dataformats='HWC')
+            if tooth not in category_metrics:
+                category_metrics[tooth] = AverageMeter(Metrics.names())
+            category_metrics[tooth].update(_metrics)
+
        
-        
             if (idx+1) % 2000 == 0:
                 print_log('Test[%d/%d] Taxonomy = %s Sample = %s Losses = %s Metrics = %s' %
-                            (idx + 1, n_samples, taxonomy_id, model_id, ['%.4f' % l for l in test_losses.val()], 
+                            (idx + 1, n_samples, tooth,  ['%.4f' % l for l in test_losses.val()], 
                             ['%.4f' % m for m in _metrics]), logger=logger)
+                
         for _,v in category_metrics.items():
             test_metrics.update(v.avg())
         print_log('[Validation] EPOCH: %d  Metrics = %s' % (epoch, ['%.4f' % m for m in test_metrics.avg()]), logger=logger)
@@ -268,39 +312,17 @@ def validate(base_model, test_dataloader, epoch, ChamferDisL1, ChamferDisL2, val
         if args.distributed:
             torch.cuda.synchronize()
      
-    # Print testing results
-    shapenet_dict = json.load(open('./data/shapenet_synset_dict.json', 'r'))
-    print_log('============================ TEST RESULTS ============================',logger=logger)
-    msg = ''
-    msg += 'Taxonomy\t'
-    msg += '#Sample\t'
-    for metric in test_metrics.items:
-        msg += metric + '\t'
-    msg += '#ModelName\t'
-    print_log(msg, logger=logger)
+    log_dict = {}  
+    print("============================ VAL RESULTS ============================")
+    print(f"Epoch: {epoch}")
 
-    for taxonomy_id in category_metrics:
-        msg = ''
-        msg += (taxonomy_id + '\t')
-        msg += (str(category_metrics[taxonomy_id].count(0)) + '\t')
-        for value in category_metrics[taxonomy_id].avg():
-            msg += '%.3f \t' % value
-        msg += shapenet_dict[taxonomy_id] + '\t'
-        print_log(msg, logger=logger)
+    for metric, value in zip(test_metrics.items, test_metrics.avg()):
+        log_dict[f"val/{metric}"] = value
+        print(f"{metric}: {value:.6f}")
 
-    msg = ''
-    msg += 'Overall\t\t'
-    for value in test_metrics.avg():
-        msg += '%.3f \t' % value
-    print_log(msg, logger=logger)
-
-    # Add testing results to TensorBoard
-    if val_writer is not None:
-        val_writer.add_scalar('Loss/Epoch/Sparse', test_losses.avg(0), epoch)
-        val_writer.add_scalar('Loss/Epoch/Dense', test_losses.avg(2), epoch)
-        for i, metric in enumerate(test_metrics.items):
-            val_writer.add_scalar('Metric/%s' % metric, test_metrics.avg(i), epoch)
-
+    if args.log_data:
+        wandb.log(log_dict, step=epoch)
+ 
     return Metrics(config.consider_metric, test_metrics.avg())
 
 def test_net(args, config):

@@ -6,52 +6,133 @@ from utils.config import *
 import time
 import os
 import torch
-from tensorboardX import SummaryWriter
+import sys
+import torch.multiprocessing as mp
+import wandb
+import shutil
+import os.path as op
+import json
+from pprint import pprint
+sys.path.append("/storage/share/code/01_scripts/modules/")
 
-def main():
+from os_tools.import_dir_path import import_dir_path, convert_path
+
+def main(rank=0, world_size=1):
     # args
-    args = parser.get_args()
-    # CUDA
+    pada = import_dir_path()
+    config = EasyDict({
+    "optimizer": {
+        "type": "AdamW",
+        "kwargs": {
+            "lr": 0.0005,
+            "weight_decay": 0.0005
+        }
+    },
+    "scheduler": {
+        "type": "CosLR",
+        "kwargs": {
+            "epochs": 300,
+            "initial_epochs": 10,
+            "warming_up_init_lr": 0.00005
+        }
+    },
+    "temp": {
+        "start": 1,
+        "target": 0.0625,
+        "ntime": 100000
+    },
+    "kldweight": {
+        "start": 0,
+        "target": 0.1,
+        "ntime": 100000
+    },
+    "model": {
+        "NAME": "DiscreteVAE",
+        "group_size": 32,
+        "num_group": 64,
+        "encoder_dims": 256,
+        "num_tokens": 8192,
+        "tokens_dims": 256,
+        "decoder_dims": 256
+    },
+    "total_bs": 256,
+    "step_per_update": 1,
+    "max_epoch": 500,
+    'model_name': 'DiscreteVAE',
+    'loss_metrics': ['Loss1', 'Loss2'],
+    "consider_metric": "CDL2",
+    })
+    
+    config['dataset'] = EasyDict(
+        {
+            "num_points": 2048,
+            "tooth_range": {
+                "teeth": 'full', 
+                "jaw": "full",
+                "quadrants": "all",
+            },
+            "data_type": "npy",
+            "use_fixed_split": True,
+            "enable_cache": True,
+            "create_cache_file": True,
+            "overwrite_cache_file": False,
+            "return_normals": False, 
+            "dataset": "orthodental",
+            "data_dir": None,
+            "datahash": "15c02eb0",
+            'normalize_mean': True,
+            'normalize_pose': False,
+            'normalize_scale': False,
+        }
+    )
+
+    args = EasyDict(
+        {
+            "launcher": "pytorch" if world_size > 1 else "none",
+            "num_gpus": world_size,
+            "local_rank": rank,
+            "num_workers": 0,  # only applies to mode='train', set to 0 for val and test
+            "seed": 0,
+            "deterministic": False,
+            "sync_bn": False,
+            "experiment_dir": pada.model_base_dir,
+            "start_ckpts": None,
+            "val_freq": 10,
+            "resume": False,
+            "mode": None,
+            "save_checkpoints": True,
+            "save_only_best": False,
+            "ckpt_dir": None,
+            "cfg_dir": None,
+            'log_testdata': True,
+            'ckpt_path': convert_path(r"O:\data\models\PoinTr\sweep\PoinTr-InfoCD-CD-downsample1\ckpt\ckpt-best-zany-sweep-2.pth"),
+            "gt_partial_saved": False,
+            'no_occlusion_val': 100,
+            "test": False,
+            "log_data": True,  # if true: wandb logger on and save ckpts to local drive
+            'log_name': 'DiscreteVAE',
+        }
+    )
     args.use_gpu = torch.cuda.is_available()
+    args.use_amp_autocast = False
+    args.device = torch.device("cuda" if args.use_gpu else "cpu")
+
+
     if args.use_gpu:
         torch.backends.cudnn.benchmark = True
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == 'none':
         args.distributed = False
-    else:
-        args.distributed = True
-        dist_utils.init_dist(args.launcher)
-        # re-set gpu_ids with distributed training mode
-        _, world_size = dist_utils.get_dist_info()
-        args.world_size = world_size
+
+    args.experiment_path = os.path.join(args.experiment_dir, config.model_name)
+    os.makedirs(args.experiment_path, exist_ok=True)
+
     # logger
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     log_file = os.path.join(args.experiment_path, f'{timestamp}.log')
     logger = get_root_logger(log_file=log_file, name=args.log_name)
-    # define the tensorboard writer
-    if not args.test:
-        if args.local_rank == 0:
-            train_writer = SummaryWriter(os.path.join(args.tfboard_path, 'train'))
-            val_writer = SummaryWriter(os.path.join(args.tfboard_path, 'test'))
-        else:
-            train_writer = None
-            val_writer = None
-    # config
-    config = get_config(args, logger = logger)
-    # batch size
-    if args.distributed:
-        assert config.total_bs % world_size == 0
-        config.dataset.train.others.bs = config.total_bs // world_size
-        config.dataset.val.others.bs = 1
-        config.dataset.test.others.bs = 1
-    else:
-        config.dataset.train.others.bs = config.total_bs
-        config.dataset.val.others.bs = 1
-        config.dataset.test.others.bs = 1
+
     # log 
-    log_args_to_file(args, 'args', logger = logger)
-    log_config_to_file(config, 'config', logger = logger)
-    # exit()
     logger.info(f'Distributed training: {args.distributed}')
     # set random seeds
     if args.seed is not None:
@@ -61,12 +142,103 @@ def main():
     if args.distributed:
         assert args.local_rank == torch.distributed.get_rank() 
 
+    if args.distributed:
+        assert config.total_bs % world_size == 0
+        config.bs = config.total_bs // world_size
+    else:
+        config.bs = config.total_bs
+
+    wandb_config = None
+
+    if args.log_data:
+        wandb.init(
+            # set the wandb project where this run will be logged, dont set config here, else sweep will fail
+            project="AutoEncoder",
+            save_code=True,
+        )
+
+        # define custom x axis metric
+        wandb.define_metric("epoch")
+
+        # set all other train/ metrics to use this step
+        wandb.define_metric("train/*", step_metric="epoch")
+        wandb.define_metric("val/*", step_metric="epoch")
+        wandb.define_metric("test/*", step_metric="epoch")
+
+        wandb.define_metric("val/pcd/dense/*", step_metric="epoch")
+        wandb.define_metric("val/pcd/coarse/*", step_metric="epoch")
+        wandb.define_metric("val/pcd/gt/*", step_metric="epoch")
+
+        # If called by wandb.agent, as below,
+        # this config will be set by Sweep Controller
+        wandb_config = wandb.config
+
+        # update the model config with wandb config
+        for key, value in wandb_config.items():
+            if "." in key:
+                keys = key.split(".")
+                config_temp = config
+                for sub_key in keys[:-1]:
+                    config_temp = config_temp.setdefault(sub_key, {})
+                config_temp[keys[-1]] = value
+            else:
+                config[key] = value
+
+    if wandb_config is not None:
+        args.sweep = True if "sweep" in wandb_config else False
+    else:
+        args.sweep = False
+    
+
+    if args.log_data and not args.test:
+        if not os.path.exists(args.experiment_path):
+            os.makedirs(args.experiment_path, exist_ok=True)
+            print("Create experiment path successfully at %s" % args.experiment_path)
+
+        shutil.copy(__file__, args.experiment_path)
+
+        args.cfg_dir = op.join(args.experiment_path, "config")
+        args.ckpt_dir = op.join(args.experiment_path, "ckpt")
+        os.makedirs(args.cfg_dir, exist_ok=True)
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        cfg_name = f"config-{wandb.run.name}.json"
+
+        with open(os.path.join(args.cfg_dir, cfg_name), "w") as json_file:
+            json_file.write(json.dumps(config, indent=4))
+
+    if args.log_data:
+        # update wandb config
+        wandb.config.update(config, allow_val_change=True)
+
+    pprint(config)
+    torch.autograd.set_detect_anomaly(True)
+
     # run
     if args.test:
         test_net(args, config)
     else:
-        run_net(args, config, train_writer, val_writer)
+        run_net(args, config)
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    # User Input
+    num_gpus = 1  # number of gpus, dont use 3
+    print("Number of GPUs: ", num_gpus)
+
+    if num_gpus > 1:
+        if num_gpus == 2:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+        elif num_gpus == 3:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+        elif num_gpus == 4:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "12345"  # Set any free port
+        os.environ["WORLD_SIZE"] = str(num_gpus)
+        # mp.spawn(main, args=(num_gpus, ), nprocs=num_gpus, join=True)
+        mp.spawn(main, args=(num_gpus,), nprocs=num_gpus, join=True)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+        main(rank=0, world_size=1)

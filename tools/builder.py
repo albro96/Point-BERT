@@ -4,31 +4,74 @@ import torch
 # optimizer
 import torch.optim as optim
 # dataloader
-from datasets import build_dataset_from_cfg
 from models import build_model_from_cfg
 # utils
 from utils.logger import *
 from utils.misc import *
 from timm.scheduler import CosineLRScheduler
 
-def dataset_builder(args, config):
-    dataset = build_dataset_from_cfg(config._base_, config.others)
-    shuffle = config.others.subset == 'train'
+# from PoinTr modified for dental data
+def dataset_builder(args, config, mode, bs):
+
+    from datasets.SingleToothDataset import SingleToothDataset
+
+    dataset = SingleToothDataset(**config, mode=mode, device=args.device)
+
+    shuffle = mode == "train"
+    drop_last = mode == "train"
+
+    if mode != "train":
+        num_workers = 0
+    else:
+        num_workers = int(args.num_workers)
+
     if args.distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle = shuffle)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size = config.others.bs,
-                                            num_workers = int(args.num_workers),
-                                            drop_last = config.others.subset == 'train',
-                                            worker_init_fn = worker_init_fn,
-                                            sampler = sampler)
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, shuffle=shuffle
+        )
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=bs,
+            num_workers=num_workers,
+            drop_last=drop_last,
+            worker_init_fn=worker_init_fn,
+            sampler=sampler,
+            pin_memory=True,
+        )
     else:
         sampler = None
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.others.bs,
-                                                shuffle = shuffle, 
-                                                drop_last = config.others.subset == 'train',
-                                                num_workers = int(args.num_workers),
-                                                worker_init_fn=worker_init_fn)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            drop_last=drop_last,
+            worker_init_fn=worker_init_fn,
+            sampler=sampler,
+            pin_memory=True,
+        )
+
     return sampler, dataloader
+
+
+# def dataset_builder(args, config):
+#     dataset = build_dataset_from_cfg(config._base_, config.others)
+#     shuffle = config.others.subset == 'train'
+#     if args.distributed:
+#         sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle = shuffle)
+#         dataloader = torch.utils.data.DataLoader(dataset, batch_size = config.others.bs,
+#                                             num_workers = int(args.num_workers),
+#                                             drop_last = config.others.subset == 'train',
+#                                             worker_init_fn = worker_init_fn,
+#                                             sampler = sampler)
+#     else:
+#         sampler = None
+#         dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.others.bs,
+#                                                 shuffle = shuffle, 
+#                                                 drop_last = config.others.subset == 'train',
+#                                                 num_workers = int(args.num_workers),
+#                                                 worker_init_fn=worker_init_fn)
+#     return sampler, dataloader
 
 def model_builder(config):
     model = build_model_from_cfg(config)
@@ -66,9 +109,9 @@ def build_opti_sche(base_model, config):
     elif sche_config.type == 'CosLR':
         scheduler = CosineLRScheduler(optimizer,
                 t_initial=sche_config.kwargs.epochs,
-                t_mul=1,
+                # t_mul=1,
                 lr_min=1e-6,
-                decay_rate=0.1,
+                # decay=0.1,
                 warmup_lr_init=1e-6,
                 warmup_t=sche_config.kwargs.initial_epochs,
                 cycle_limit=1,
@@ -124,16 +167,30 @@ def resume_optimizer(optimizer, args, logger = None):
     # optimizer
     optimizer.load_state_dict(state_dict['optimizer'])
 
-def save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, prefix, args, logger = None):
+def save_checkpoint(
+    base_model, optimizer, epoch, metrics, best_metrics, prefix, args, logger=None
+):
     if args.local_rank == 0:
-        torch.save({
-                    'base_model' : base_model.module.state_dict() if args.distributed else base_model.state_dict(),
-                    'optimizer' : optimizer.state_dict(),
-                    'epoch' : epoch,
-                    'metrics' : metrics.state_dict() if metrics is not None else dict(),
-                    'best_metrics' : best_metrics.state_dict() if best_metrics is not None else dict(),
-                    }, os.path.join(args.experiment_path, prefix + '.pth'))
-        print_log(f"Save checkpoint at {os.path.join(args.experiment_path, prefix + '.pth')}", logger = logger)
+        torch.save(
+            {
+                "base_model": (
+                    base_model.module.state_dict()
+                    if args.distributed
+                    else base_model.state_dict()
+                ),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "metrics": metrics.state_dict() if metrics is not None else dict(),
+                "best_metrics": (
+                    best_metrics.state_dict() if best_metrics is not None else dict()
+                ),
+            },
+            os.path.join(args.ckpt_dir, prefix + ".pth"),
+        )
+        print_log(
+            f"Save checkpoint at {os.path.join(args.ckpt_dir, prefix + '.pth')}",
+            logger=logger,
+        )
 
 def load_model(base_model, ckpt_path, logger = None):
     if not os.path.exists(ckpt_path):

@@ -11,7 +11,6 @@ from utils.checkpoint import get_missing_parameters_message, get_unexpected_para
 from utils.logger import *
 
 
-
 from knn_cuda import KNN
 knn = KNN(k=4, transpose_mode=False)
 
