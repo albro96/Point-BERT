@@ -1,8 +1,3 @@
-from tools import run_net
-from tools import test_net
-from utils import parser, dist_utils, misc
-from utils.logger import *
-from utils.config import *
 import time
 import os
 import torch
@@ -13,25 +8,35 @@ import shutil
 import os.path as op
 import json
 from pprint import pprint
-sys.path.append("/storage/share/code/01_scripts/modules/")
+import argparse
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(BASE_DIR, "../"))
+sys.path.append("/storage/share/repos/code/01_scripts/modules/")
 
 from os_tools.import_dir_path import import_dir_path, convert_path
+from tools import run_net
+from tools import test_net
+from utils import parser, dist_utils, misc
+from utils.logger import *
+from utils.config import *
 
 def main(rank=0, world_size=1):
     # args
     pada = import_dir_path()
     config = EasyDict({
     "optimizer": {
-        "type": "AdamW",
+        "type": "AdamW"
         "kwargs": {
-            "lr": 0.0005,
-            "weight_decay": 0.0005
+            "lr": 0.0005, #0.0005,
+            "weight_decay": 0.0005, # 0.0005
         }
     },
     "scheduler": {
         "type": "CosLR",
         "kwargs": {
-            "epochs": 300,
+            "epochs": 500,
             "initial_epochs": 10,
             "warming_up_init_lr": 0.00005
         }
@@ -54,15 +59,18 @@ def main(rank=0, world_size=1):
         "num_tokens": 8192,
         "tokens_dims": 256,
         "decoder_dims": 256
-    },
+        },
     "total_bs": 256,
     "step_per_update": 1,
     "max_epoch": 500,
     'model_name': 'DiscreteVAE',
     'loss_metrics': ['Loss1', 'Loss2'],
     "consider_metric": "CDL2",
+    'val_metrics': [
+        "CDL1",
+        "CDL2"   ]
     })
-    
+
     config['dataset'] = EasyDict(
         {
             "num_points": 2048,
@@ -113,6 +121,13 @@ def main(rank=0, world_size=1):
             'log_name': 'DiscreteVAE',
         }
     )
+
+
+    if args.local_rank is not None:
+        if "LOCAL_RANK" not in os.environ:
+            os.environ["LOCAL_RANK"] = str(args.local_rank)
+
+
     args.use_gpu = torch.cuda.is_available()
     args.use_amp_autocast = False
     args.device = torch.device("cuda" if args.use_gpu else "cpu")
@@ -124,21 +139,7 @@ def main(rank=0, world_size=1):
     if args.launcher == 'none':
         args.distributed = False
 
-    args.experiment_path = os.path.join(args.experiment_dir, config.model_name)
-    os.makedirs(args.experiment_path, exist_ok=True)
-
-    # logger
-    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
-    log_file = os.path.join(args.experiment_path, f'{timestamp}.log')
-    logger = get_root_logger(log_file=log_file, name=args.log_name)
-
-    # log 
-    logger.info(f'Distributed training: {args.distributed}')
-    # set random seeds
-    if args.seed is not None:
-        logger.info(f'Set random seed to {args.seed}, '
-                    f'deterministic: {args.deterministic}')
-        misc.set_random_seed(args.seed + args.local_rank, deterministic=args.deterministic) # seed + rank, for augmentation
+    
     if args.distributed:
         assert args.local_rank == torch.distributed.get_rank() 
 
@@ -151,10 +152,10 @@ def main(rank=0, world_size=1):
     wandb_config = None
 
     if args.log_data:
+                    # set the wandb project where this run will be logged, dont set config here, else sweep will fail   
         wandb.init(
-            # set the wandb project where this run will be logged, dont set config here, else sweep will fail
-            project="AutoEncoder",
-            save_code=True,
+         project="AutoEncoder",
+        save_code=True,
         )
 
         # define custom x axis metric
@@ -184,11 +185,36 @@ def main(rank=0, world_size=1):
             else:
                 config[key] = value
 
+    # config.model.update(network_config_dict[config.model_name].model)
+
+
     if wandb_config is not None:
         args.sweep = True if "sweep" in wandb_config else False
     else:
         args.sweep = False
-    
+
+    args.log_data = args.sweep or args.log_data
+
+    args.experiment_path = os.path.join(args.experiment_dir, config.model_name)
+    # os.makedirs(args.experiment_path, exist_ok=True)
+
+    # logger
+    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+    log_file = os.path.join(args.experiment_path, f'{timestamp}.log')
+    logger = get_root_logger(log_file=log_file, name=args.log_name)
+
+    # log 
+    logger.info(f'Distributed training: {args.distributed}')
+    # set random seeds
+    if args.seed is not None:
+        logger.info(f'Set random seed to {args.seed}, '
+                    f'deterministic: {args.deterministic}')
+        misc.set_random_seed(args.seed + args.local_rank, deterministic=args.deterministic) # seed + rank, for augmentation
+
+    if args.sweep:
+        args.experiment_path = os.path.join(
+            args.experiment_path, "sweep", config.sweepname
+        )
 
     if args.log_data and not args.test:
         if not os.path.exists(args.experiment_path):
@@ -213,11 +239,11 @@ def main(rank=0, world_size=1):
     pprint(config)
     torch.autograd.set_detect_anomaly(True)
 
-    # run
-    if args.test:
-        test_net(args, config)
-    else:
-        run_net(args, config)
+    # # run
+    # if args.test:
+    #     test_net(args, config)
+    # else:
+    run_net(args, config)
 
 
 if __name__ == "__main__":

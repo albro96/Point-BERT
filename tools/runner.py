@@ -162,10 +162,11 @@ def run_net(args, config):
             batch_time.update(time.time() - batch_start_time)
             batch_start_time = time.time()
 
-            if idx % 20 == 0:
+            if not args.sweep and idx % 20 == 0:
                 print_log('[Epoch %d/%d][Batch %d/%d] BatchTime = %.3f (s) DataTime = %.3f (s) Losses = %s lr = %.6f' %
                             (epoch, config.max_epoch, idx + 1, n_batches, batch_time.val(), data_time.val(),
                             ['%.4f' % l for l in losses.val()], optimizer.param_groups[0]['lr']), logger = logger)
+                
         if config.scheduler.type != 'function':
             if isinstance(scheduler, list):
                 for item in scheduler:
@@ -238,9 +239,10 @@ def validate(base_model, val_dataloader, epoch, ChamferDisL1, ChamferDisL2, args
     print_log(f"[VALIDATION] Start validating epoch {epoch}", logger = logger)
     base_model.eval()  # set model to eval mode
 
-    test_losses = AverageMeter(['SparseLossL1', 'SparseLossL2', 'DenseLossL1', 'DenseLossL2'])
-    test_metrics = AverageMeter(Metrics.names())
-    category_metrics = dict()
+    # test_losses = AverageMeter(['SparseLossL1', 'SparseLossL2', 'DenseLossL1', 'DenseLossL2'])
+    # test_metrics = AverageMeter(config.val_metrics)
+    val_metrics = {metric: [] for metric in config.val_metrics}
+    # category_metrics = dict()
     n_samples = len(val_dataloader) # bs is 1
 
     with torch.no_grad():
@@ -252,20 +254,24 @@ def validate(base_model, val_dataloader, epoch, ChamferDisL1, ChamferDisL2, args
             coarse_points = ret[0]
             dense_points = ret[1]
 
-            sparse_loss_l1 =  ChamferDisL1(coarse_points, points)
-            sparse_loss_l2 =  ChamferDisL2(coarse_points, points)
-            dense_loss_l1 =  ChamferDisL1(dense_points, points)
-            dense_loss_l2 =  ChamferDisL2(dense_points, points)
+            # sparse_loss_l1 =  ChamferDisL1(coarse_points, points)
+            # sparse_loss_l2 =  ChamferDisL2(coarse_points, points)
+            # dense_loss_l1 =  ChamferDisL1(dense_points, points)
+            # dense_loss_l2 =  ChamferDisL2(dense_points, points)
 
-            if args.distributed:
-                sparse_loss_l1 = dist_utils.reduce_tensor(sparse_loss_l1, args)
-                sparse_loss_l2 = dist_utils.reduce_tensor(sparse_loss_l2, args)
-                dense_loss_l1 = dist_utils.reduce_tensor(dense_loss_l1, args)
-                dense_loss_l2 = dist_utils.reduce_tensor(dense_loss_l2, args)
+            # if args.distributed:
+            #     sparse_loss_l1 = dist_utils.reduce_tensor(sparse_loss_l1, args)
+            #     sparse_loss_l2 = dist_utils.reduce_tensor(sparse_loss_l2, args)
+            #     dense_loss_l1 = dist_utils.reduce_tensor(dense_loss_l1, args)
+            #     dense_loss_l2 = dist_utils.reduce_tensor(dense_loss_l2, args)
 
-            test_losses.update([sparse_loss_l1.item() * 1000, sparse_loss_l2.item() * 1000, dense_loss_l1.item() * 1000, dense_loss_l2.item() * 1000])
+            # test_losses.update([sparse_loss_l1.item() * 1000, sparse_loss_l2.item() * 1000, dense_loss_l1.item() * 1000, dense_loss_l2.item() * 1000])
 
-            _metrics = Metrics.get(dense_points, points)
+            _metrics = Metrics.get(dense_points, points, metrics=config.val_metrics)
+            for metric, value in _metrics.items():
+                _metrics[metric] = value.item()
+            for metric in val_metrics:
+                val_metrics[metric].append(_metrics[metric])
 
             if (val_dataloader.dataset.patient == "0538") and args.log_data and str(tooth)[-1] in ['1', '6']:
                 print('Logging PCDs')
@@ -295,19 +301,19 @@ def validate(base_model, val_dataloader, epoch, ChamferDisL1, ChamferDisL2, args
                 )
 
 
-            if tooth not in category_metrics:
-                category_metrics[tooth] = AverageMeter(Metrics.names())
-            category_metrics[tooth].update(_metrics)
+            # if tooth not in category_metrics:
+            #     category_metrics[tooth] = AverageMeter(config.val_metrics)
+            # category_metrics[tooth].update(_metrics)
 
        
-            if (idx+1) % 2000 == 0:
-                print_log('Test[%d/%d] Taxonomy = %s Sample = %s Losses = %s Metrics = %s' %
-                            (idx + 1, n_samples, tooth,  ['%.4f' % l for l in test_losses.val()], 
-                            ['%.4f' % m for m in _metrics]), logger=logger)
+            # if (idx+1) % 2000 == 0:
+            #     print_log('Test[%d/%d] Taxonomy = %s Sample = %s Losses = %s Metrics = %s' %
+            #                 (idx + 1, n_samples, tooth,  ['%.4f' % l for l in test_losses.val()], 
+            #                 ['%.4f' % m for m in _metrics]), logger=logger)
                 
-        for _,v in category_metrics.items():
-            test_metrics.update(v.avg())
-        print_log('[Validation] EPOCH: %d  Metrics = %s' % (epoch, ['%.4f' % m for m in test_metrics.avg()]), logger=logger)
+        # for _,v in category_metrics.items():
+        #     test_metrics.update(v.avg())
+        # print_log('[Validation] EPOCH: %d  Metrics = %s' % (epoch, ['%.4f' % m for m in test_metrics.avg()]), logger=logger)
 
         if args.distributed:
             torch.cuda.synchronize()
@@ -316,14 +322,24 @@ def validate(base_model, val_dataloader, epoch, ChamferDisL1, ChamferDisL2, args
     print("============================ VAL RESULTS ============================")
     print(f"Epoch: {epoch}")
 
-    for metric, value in zip(test_metrics.items, test_metrics.avg()):
-        log_dict[f"val/{metric}"] = value
-        print(f"{metric}: {value:.6f}")
+    mean_val_metrics = []
+    for metric, values in val_metrics.items():
+        values = torch.tensor(values)
+        mean = torch.mean(values)
+        mean_val_metrics.append(mean)
+        median = torch.median(values)
+        log_dict[f"val/{metric}"] = mean
+        log_dict[f"val/{metric}-median"] = median
+        print(f"{metric}: {mean:.6f}/{median:.6f}")
 
     if args.log_data:
         wandb.log(log_dict, step=epoch)
  
-    return Metrics(config.consider_metric, test_metrics.avg())
+    return Metrics(
+        metric_name=config.consider_metric,
+        values=mean_val_metrics,
+        metrics=config.val_metrics,
+    )
 
 def test_net(args, config):
     logger = get_logger(args.log_name)
